@@ -339,6 +339,7 @@ st.markdown('<div class="wav-subtitle">Clip Maker</div>', unsafe_allow_html=True
 st.markdown('<div class="section-label">Add a clip</div>', unsafe_allow_html=True)
 
 with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
+    # File uploader lives outside the form so auto_output_name can update before submit
     source_type = st.radio(
         "Source video",
         ["Upload from device", "Google Drive link"],
@@ -364,42 +365,35 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
             label_visibility="collapsed",
         )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start = st.text_input("Start time", placeholder="0:47", value="")
-    with col2:
-        end = st.text_input("End time", placeholder="0:58", value="")
-
-    output_name = st.text_input(
-        "Output filename",
-        value=st.session_state.auto_output_name,
-    )
-
-    banner = st.text_input(
-        "Caption  —  wrap [highlighted words] in brackets for gold",
-        placeholder='This one [hits different] — you need to hear it',
-        value="",
-    )
-
-    # Live banner preview
-    if banner.strip():
-        st.markdown('<div class="preview-label">Caption preview</div>', unsafe_allow_html=True)
-        try:
-            preview_img = render_banner_image(banner, width=480)
-            st.image(preview_img, use_container_width=False)
-        except Exception as e:
-            st.caption(f"Preview unavailable: {e}")
-
     single_mode = len(st.session_state.queue) == 0
-    if single_mode:
-        col_add, col_gen = st.columns(2)
-        with col_add:
-            add_clicked = st.button("Add to queue", use_container_width=True)
-        with col_gen:
-            gen_clicked = st.button("🎬  Generate", use_container_width=True)
-    else:
-        add_clicked = st.button("Add to queue", use_container_width=True)
-        gen_clicked = False
+
+    with st.form("add_clip_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            start = st.text_input("Start time", placeholder="0:47", value="")
+        with col2:
+            end = st.text_input("End time", placeholder="0:58", value="")
+
+        output_name = st.text_input(
+            "Output filename",
+            value=st.session_state.auto_output_name,
+        )
+
+        banner = st.text_input(
+            "Caption  —  wrap [highlighted words] in brackets for gold",
+            placeholder='This one [hits different] — you need to hear it',
+            value="",
+        )
+
+        if single_mode:
+            col_add, col_gen = st.columns(2)
+            with col_add:
+                add_clicked = st.form_submit_button("Add to queue", use_container_width=True)
+            with col_gen:
+                gen_clicked = st.form_submit_button("🎬  Generate", use_container_width=True)
+        else:
+            add_clicked = st.form_submit_button("Add to queue", use_container_width=True)
+            gen_clicked = False
 
     form_clicked = add_clicked or gen_clicked
 
@@ -592,9 +586,18 @@ if st.session_state.queue:
         st.markdown("")
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w") as zf:
+            seen = {}
             for clip in done:
-                if clip["id"] in st.session_state.results:
-                    zf.writestr(clip["output"], st.session_state.results[clip["id"]])
+                if clip["id"] not in st.session_state.results:
+                    continue
+                name = clip["output"]
+                if name in seen:
+                    seen[name] += 1
+                    stem = name[:-4] if name.endswith(".mp4") else name
+                    name = f"{stem}_{seen[clip['output']]}.mp4"
+                else:
+                    seen[name] = 1
+                zf.writestr(name, st.session_state.results[clip["id"]])
         st.download_button(
             f"⬇  Download all {len(done)} clips as ZIP",
             data=zip_buf.getvalue(),
