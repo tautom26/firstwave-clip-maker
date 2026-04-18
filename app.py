@@ -497,7 +497,7 @@ if st.session_state.queue:
         if clip["status"] in ("waiting", "error"):
             try:
                 banner_img = render_banner_image(clip["banner"], width=400)
-                st.image(banner_img, use_container_width=False)
+                st.image(banner_img, width="content")
             except Exception:
                 pass
 
