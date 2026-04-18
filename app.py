@@ -4,6 +4,7 @@ Run: streamlit run app.py
 """
 
 import atexit
+import html
 import io
 import json
 import os
@@ -16,6 +17,17 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
+
+MAX_BANNER_LEN = 200
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+DRIVE_URL_RE = re.compile(r"^https?://(drive|docs)\.google\.com/.+", re.I)
+
+
+def safe_filename(name: str, default: str = "clip.mp4") -> str:
+    """Strip path components and unsafe chars. Guarantees a plausible filename."""
+    base = Path(name or "").name
+    cleaned = SAFE_NAME_RE.sub("_", base).strip("._") or default
+    return cleaned
 
 import streamlit as st
 
@@ -153,15 +165,24 @@ BG_COLOR      = (0, 0, 0)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def to_sec(t: str) -> float:
+    if not t or not isinstance(t, str):
+        raise ValueError("Empty timestamp")
+    parts = t.strip().split(":")
+    if not parts or any(p == "" for p in parts):
+        raise ValueError(f"Invalid timestamp: {t!r}")
     s = 0.0
-    for p in t.strip().split(":"): s = s * 60 + float(p)
+    for p in parts:
+        s = s * 60 + float(p)
+    if s < 0:
+        raise ValueError(f"Negative timestamp: {t!r}")
     return s
 
 
-def run_cmd(cmd: str):
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+def run_cmd(args):
+    """Run a subprocess without a shell. args is a list of strings."""
+    r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(r.stderr[-600:])
+        raise RuntimeError((r.stderr or r.stdout or "")[-600:])
     return r
 
 
@@ -268,12 +289,16 @@ def make_mask_png(size: int, out_path: str):
 
 def download_drive_file(drive_url: str, dest: str):
     """Download a file from a Google Drive share link using gdown."""
+    if not DRIVE_URL_RE.match(drive_url or ""):
+        raise RuntimeError("That doesn't look like a Google Drive URL.")
     try:
         import gdown
     except ImportError:
-        subprocess.run("pip install gdown -q", shell=True)
-        import gdown
-    result = gdown.download(url=drive_url, output=dest, quiet=False, fuzzy=True)
+        raise RuntimeError("gdown is not installed. Add it to requirements.txt.")
+    try:
+        result = gdown.download(url=drive_url, output=dest, quiet=True, fuzzy=True)
+    except Exception as e:
+        raise RuntimeError(f"Drive download failed: {e}")
     if not result or not os.path.exists(dest) or os.path.getsize(dest) == 0:
         raise RuntimeError(
             "Could not download from Google Drive. "
@@ -286,17 +311,24 @@ def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str
     vid_x    = VIDEO_INSET
     vid_y    = (FRAME_H - vid_size) // 2
 
+    start_s = to_sec(start)
+    end_s   = to_sec(end)
+    dur     = end_s - start_s
+    if dur <= 0:
+        raise ValueError("End time must be after start time.")
+
     with tempfile.TemporaryDirectory() as tmp:
         trimmed    = os.path.join(tmp, "clip.mp4")
         banner_png = os.path.join(tmp, "banner.png")
         mask_png   = os.path.join(tmp, "mask.png")
 
-        dur = to_sec(end) - to_sec(start)
-        run_cmd(
-            f'ffmpeg -y -loglevel error '
-            f'-ss {to_sec(start):.3f} -i "{src_path}" '
-            f'-t {dur:.3f} -c:v libx264 -c:a aac "{trimmed}"'
-        )
+        run_cmd([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{start_s:.3f}", "-i", src_path,
+            "-t", f"{dur:.3f}",
+            "-c:v", "libx264", "-c:a", "aac",
+            trimmed,
+        ])
         if on_step: on_step("Rendering banner…")
 
         make_banner_png(banner, banner_png)
@@ -308,14 +340,18 @@ def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str
             f"[vid][2:v]alphamerge[masked];"
             f"[0:v][masked]overlay={vid_x}:{vid_y}[out]"
         )
-        run_cmd(
-            f'ffmpeg -y -loglevel error '
-            f'-loop 1 -i "{banner_png}" -i "{trimmed}" -i "{mask_png}" '
-            f'-filter_complex "{fc}" '
-            f'-map "[out]" -map 1:a '
-            f'-c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k '
-            f'-shortest "{out_path}"'
-        )
+        run_cmd([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-loop", "1", "-i", banner_png,
+            "-i", trimmed,
+            "-i", mask_png,
+            "-filter_complex", fc,
+            "-map", "[out]", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            out_path,
+        ])
 
 
 # ── Session state init ────────────────────────────────────────────────────────
@@ -368,13 +404,20 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
         if uploaded_file:
             if uploaded_file.size > 200 * 1024 * 1024:
                 st.warning("Large files (200MB+) may cause processing issues. Consider trimming the video before uploading.")
-            file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+            safe_upload_name = safe_filename(uploaded_file.name, default="video.mp4")
+            file_key = f"{safe_upload_name}_{uploaded_file.size}"
             if file_key != st.session_state.last_file_key:
                 st.session_state.last_file_key = file_key
-                st.session_state.auto_output_name = Path(uploaded_file.name).stem + "_clip.mp4"
+                st.session_state.auto_output_name = Path(safe_upload_name).stem + "_clip.mp4"
+                # Ensure upload dir still exists (could be wiped between runs on some hosts)
+                os.makedirs(st.session_state.upload_dir, exist_ok=True)
                 # Clean up files no longer referenced by any queue entry
                 referenced = {c["file_path"] for c in st.session_state.queue if c.get("file_path")}
-                for fname in os.listdir(st.session_state.upload_dir):
+                try:
+                    entries = os.listdir(st.session_state.upload_dir)
+                except OSError:
+                    entries = []
+                for fname in entries:
                     fpath = os.path.join(st.session_state.upload_dir, fname)
                     if fpath not in referenced:
                         try:
@@ -382,7 +425,7 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
                         except OSError:
                             pass
                 # Timestamp prefix ensures unique path even for same-named files
-                dest = os.path.join(st.session_state.upload_dir, f"{int(time.time() * 1000)}_{uploaded_file.name}")
+                dest = os.path.join(st.session_state.upload_dir, f"{int(time.time() * 1000)}_{safe_upload_name}")
                 with open(dest, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 st.session_state.last_upload_path = dest
@@ -429,22 +472,30 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
         errors = []
         if source_type == "Upload from device" and not uploaded_file:
             errors.append("Please upload a video file.")
-        if source_type == "Google Drive link" and not drive_url:
-            errors.append("Please paste a Google Drive link.")
+        if source_type == "Google Drive link":
+            if not drive_url:
+                errors.append("Please paste a Google Drive link.")
+            elif not DRIVE_URL_RE.match(drive_url):
+                errors.append("That doesn't look like a Google Drive URL.")
         if not start or not end:
             errors.append("Start and end times are required.")
         if not banner.strip():
             errors.append("Caption is required.")
+        elif len(banner) > MAX_BANNER_LEN:
+            errors.append(f"Caption is too long (max {MAX_BANNER_LEN} characters).")
         if not output_name.strip():
             errors.append("Output filename is required.")
         else:
-            if not output_name.endswith(".mp4"):
+            output_name = safe_filename(output_name, default="clip.mp4")
+            if not output_name.lower().endswith(".mp4"):
                 output_name += ".mp4"
 
         if not errors:
             try:
-                to_sec(start)
-                to_sec(end)
+                s_val = to_sec(start)
+                e_val = to_sec(end)
+                if e_val <= s_val:
+                    errors.append("End time must be after start time.")
             except (ValueError, AttributeError):
                 errors.append("Please use MM:SS format, e.g. 0:47")
 
@@ -484,13 +535,19 @@ if st.session_state.queue:
             "error":      '<span class="badge-error">✗ Error</span>',
         }.get(clip["status"], "")
 
-        src_label = Path(clip["filename"]).name if clip["filename"] else "unknown"
+        src_label = html.escape(Path(clip["filename"]).name if clip["filename"] else "unknown")
+        e_start   = html.escape(str(clip["start"]))
+        e_end     = html.escape(str(clip["end"]))
+        e_output  = html.escape(str(clip["output"]))
+        err_html  = ""
+        if clip.get("error"):
+            err_html = f'<div style="color:#f87171;font-size:0.8rem;margin-top:0.3rem">{html.escape(str(clip["error"]))}</div>'
 
         st.markdown(f"""
         <div class="clip-card">
-            <div class="clip-card-title">📁 {src_label} &nbsp;&nbsp; {clip['start']} → {clip['end']} &nbsp;&nbsp; {status_html}</div>
-            <div class="clip-card-meta">→ {clip['output']}</div>
-            {'<div style="color:#f87171;font-size:0.8rem;margin-top:0.3rem">'+clip["error"]+'</div>' if clip.get("error") else ''}
+            <div class="clip-card-title">📁 {src_label} &nbsp;&nbsp; {e_start} → {e_end} &nbsp;&nbsp; {status_html}</div>
+            <div class="clip-card-meta">→ {e_output}</div>
+            {err_html}
         </div>
         """, unsafe_allow_html=True)
 
