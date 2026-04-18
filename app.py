@@ -315,11 +315,17 @@ def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str
 
 # ── Session state init ────────────────────────────────────────────────────────
 if "queue" not in st.session_state:
-    st.session_state.queue = []          # list of clip dicts
+    st.session_state.queue = []
 if "source_cache" not in st.session_state:
-    st.session_state.source_cache = {}   # drive_url/filename → local tmp path
+    st.session_state.source_cache = {}
 if "results" not in st.session_state:
-    st.session_state.results = {}        # clip_id → bytes
+    st.session_state.results = {}
+if "auto_generate" not in st.session_state:
+    st.session_state.auto_generate = False
+if "last_uploaded_name" not in st.session_state:
+    st.session_state.last_uploaded_name = None
+if "auto_output_name" not in st.session_state:
+    st.session_state.auto_output_name = ""
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -346,6 +352,9 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
             "Video file", type=["mp4", "mov", "mkv"],
             label_visibility="collapsed"
         )
+        if uploaded_file and uploaded_file.name != st.session_state.last_uploaded_name:
+            st.session_state.last_uploaded_name = uploaded_file.name
+            st.session_state.auto_output_name = Path(uploaded_file.name).stem + "_clip.mp4"
     else:
         drive_url = st.text_input(
             "Google Drive share link",
@@ -361,13 +370,12 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
 
     output_name = st.text_input(
         "Output filename",
-        placeholder="gulmohar_clip1.mp4",
-        value="",
+        value=st.session_state.auto_output_name,
     )
 
     banner = st.text_input(
         "Caption  —  wrap [highlighted words] in brackets for gold",
-        placeholder='Dreamiest song by [Ramil] <3',
+        placeholder='This one [hits different] — you need to hear it',
         value="",
     )
 
@@ -380,9 +388,20 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
         except Exception as e:
             st.caption(f"Preview unavailable: {e}")
 
-    add_clicked = st.button("Add to queue", use_container_width=True)
+    single_mode = len(st.session_state.queue) == 0
+    if single_mode:
+        col_add, col_gen = st.columns(2)
+        with col_add:
+            add_clicked = st.button("Add to queue", use_container_width=True)
+        with col_gen:
+            gen_clicked = st.button("🎬  Generate", use_container_width=True)
+    else:
+        add_clicked = st.button("Add to queue", use_container_width=True)
+        gen_clicked = False
 
-    if add_clicked:
+    form_clicked = add_clicked or gen_clicked
+
+    if form_clicked:
         errors = []
         if source_type == "Upload from device" and not uploaded_file:
             errors.append("Please upload a video file.")
@@ -417,6 +436,8 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
                 "error":       None,
             }
             st.session_state.queue.append(entry)
+            if gen_clicked:
+                st.session_state.auto_generate = True
             st.rerun()
 
 
@@ -468,74 +489,80 @@ if st.session_state.queue:
     done    = [c for c in st.session_state.queue if c["status"] == "done"]
 
     st.markdown("")
+    auto_gen = st.session_state.auto_generate
+    if auto_gen:
+        st.session_state.auto_generate = False
+
+    run_generation = False
     if waiting:
-        if st.button(f"🎬  Generate {len(waiting)} clip{'s' if len(waiting)>1 else ''}", use_container_width=True):
+        if auto_gen:
+            run_generation = True
+        elif st.button(f"🎬  Generate {len(waiting)} clip{'s' if len(waiting)>1 else ''}", use_container_width=True):
+            run_generation = True
 
-            # Count steps: one per unique Drive source to download + one per clip to render
-            drive_keys = {c["filename"] for c in waiting if c["source_type"] == "Google Drive link"}
-            total_steps = len(drive_keys) + len(waiting)
-            step = 0
+    if run_generation:
+        drive_keys = {c["filename"] for c in waiting if c["source_type"] == "Google Drive link"}
+        total_steps = len(drive_keys) + len(waiting)
+        step = 0
 
-            progress = st.progress(0, text="Starting…")
+        progress = st.progress(0, text="Starting…")
 
-            with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
 
-                # Download / save sources (deduplicate by filename)
-                source_paths = {}
-                for clip in waiting:
-                    key = clip["filename"]
-                    if key in source_paths:
-                        continue
+            source_paths = {}
+            for clip in waiting:
+                key = clip["filename"]
+                if key in source_paths:
+                    continue
 
-                    if clip["source_type"] == "Upload from device":
-                        dest = os.path.join(tmp, f"src_{key}")
-                        with open(dest, "wb") as f:
-                            f.write(clip["file_bytes"])
-                        source_paths[key] = dest
+                if clip["source_type"] == "Upload from device":
+                    dest = os.path.join(tmp, f"src_{key}")
+                    with open(dest, "wb") as f:
+                        f.write(clip["file_bytes"])
+                    source_paths[key] = dest
 
-                    else:  # Google Drive
-                        dest = os.path.join(tmp, f"src_{Path(key).name or 'video.mp4'}")
-                        progress.progress(step / total_steps, text=f"Downloading source from Google Drive…")
-                        try:
-                            download_drive_file(clip["drive_url"], dest)
-                            source_paths[key] = dest
-                        except Exception as e:
-                            for c in waiting:
-                                if c["filename"] == key:
-                                    c["status"] = "error"
-                                    c["error"]  = f"Drive download failed: {e}"
-                        step += 1
-                        progress.progress(step / total_steps, text="Source downloaded.")
-
-                # Process each waiting clip
-                for i, clip in enumerate(waiting):
-                    src = source_paths.get(clip["filename"])
-                    if not src or not os.path.exists(src):
-                        clip["status"] = "error"
-                        clip["error"]  = "Source file unavailable."
-                        step += 1
-                        progress.progress(step / total_steps)
-                        continue
-
-                    clip["status"] = "processing"
-                    out_path = os.path.join(tmp, clip["output"])
-                    progress.progress(step / total_steps, text=f"Rendering clip {i+1}/{len(waiting)}: {clip['output']}…")
-
+                else:  # Google Drive
+                    dest = os.path.join(tmp, f"src_{Path(key).name or 'video.mp4'}")
+                    progress.progress(step / total_steps, text=f"Downloading source from Google Drive…")
                     try:
-                        process_clip(src, clip["start"], clip["end"], clip["banner"], out_path)
-                        with open(out_path, "rb") as f:
-                            st.session_state.results[clip["id"]] = f.read()
-                        clip["status"] = "done"
-                        clip["error"]  = None
+                        download_drive_file(clip["drive_url"], dest)
+                        source_paths[key] = dest
                     except Exception as e:
-                        clip["status"] = "error"
-                        clip["error"]  = str(e)[:200]
+                        for c in waiting:
+                            if c["filename"] == key:
+                                c["status"] = "error"
+                                c["error"]  = f"Drive download failed: {e}"
+                    step += 1
+                    progress.progress(step / total_steps, text="Source downloaded.")
 
+            for i, clip in enumerate(waiting):
+                src = source_paths.get(clip["filename"])
+                if not src or not os.path.exists(src):
+                    clip["status"] = "error"
+                    clip["error"]  = "Source file unavailable."
                     step += 1
                     progress.progress(step / total_steps)
+                    continue
 
-            progress.progress(1.0, text="Done!")
-            st.rerun()
+                clip["status"] = "processing"
+                out_path = os.path.join(tmp, clip["output"])
+                progress.progress(step / total_steps, text=f"Rendering clip {i+1}/{len(waiting)}: {clip['output']}…")
+
+                try:
+                    process_clip(src, clip["start"], clip["end"], clip["banner"], out_path)
+                    with open(out_path, "rb") as f:
+                        st.session_state.results[clip["id"]] = f.read()
+                    clip["status"] = "done"
+                    clip["error"]  = None
+                except Exception as e:
+                    clip["status"] = "error"
+                    clip["error"]  = str(e)[:200]
+
+                step += 1
+                progress.progress(step / total_steps)
+
+        progress.progress(1.0, text="Done!")
+        st.rerun()
 
     # ── Download all as ZIP ───────────────────────────────────────────────────
     if done and len(done) > 1:
