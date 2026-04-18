@@ -3,14 +3,17 @@ Discover.Wav Clip Maker — Streamlit App
 Run: streamlit run app.py
 """
 
+import atexit
 import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -324,10 +327,17 @@ if "results" not in st.session_state:
     st.session_state.results = {}
 if "auto_generate" not in st.session_state:
     st.session_state.auto_generate = False
-if "last_uploaded_name" not in st.session_state:
-    st.session_state.last_uploaded_name = None
 if "auto_output_name" not in st.session_state:
     st.session_state.auto_output_name = ""
+if "last_upload_path" not in st.session_state:
+    st.session_state.last_upload_path = None
+if "last_file_key" not in st.session_state:
+    st.session_state.last_file_key = None
+if "upload_dir" not in st.session_state:
+    session_dir = os.path.join(tempfile.gettempdir(), f"wav_{uuid.uuid4().hex}")
+    os.makedirs(session_dir, exist_ok=True)
+    st.session_state.upload_dir = session_dir
+    atexit.register(shutil.rmtree, session_dir, ignore_errors=True)
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -355,9 +365,27 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
             "Video file", type=["mp4", "mov", "mkv"],
             label_visibility="collapsed"
         )
-        if uploaded_file and uploaded_file.name != st.session_state.last_uploaded_name:
-            st.session_state.last_uploaded_name = uploaded_file.name
-            st.session_state.auto_output_name = Path(uploaded_file.name).stem + "_clip.mp4"
+        if uploaded_file:
+            if uploaded_file.size > 200 * 1024 * 1024:
+                st.warning("Large files (200MB+) may cause processing issues. Consider trimming the video before uploading.")
+            file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+            if file_key != st.session_state.last_file_key:
+                st.session_state.last_file_key = file_key
+                st.session_state.auto_output_name = Path(uploaded_file.name).stem + "_clip.mp4"
+                # Clean up files no longer referenced by any queue entry
+                referenced = {c["file_path"] for c in st.session_state.queue if c.get("file_path")}
+                for fname in os.listdir(st.session_state.upload_dir):
+                    fpath = os.path.join(st.session_state.upload_dir, fname)
+                    if fpath not in referenced:
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+                # Timestamp prefix ensures unique path even for same-named files
+                dest = os.path.join(st.session_state.upload_dir, f"{int(time.time() * 1000)}_{uploaded_file.name}")
+                with open(dest, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                st.session_state.last_upload_path = dest
     else:
         drive_url = st.text_input(
             "Google Drive share link",
@@ -430,7 +458,7 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
                 "source_type": source_type,
                 "drive_url":   drive_url,
                 "filename":    uploaded_file.name if uploaded_file else (drive_url or ""),
-                "file_bytes":  uploaded_file.read() if uploaded_file else None,
+                "file_path":   st.session_state.get("last_upload_path") if source_type == "Upload from device" else None,
                 "start":       start,
                 "end":         end,
                 "banner":      banner,
@@ -525,10 +553,13 @@ if st.session_state.queue:
                     continue
 
                 if clip["source_type"] == "Upload from device":
-                    dest = os.path.join(tmp, f"src_{key}")
-                    with open(dest, "wb") as f:
-                        f.write(clip["file_bytes"])
-                    source_paths[key] = dest
+                    file_path = clip.get("file_path")
+                    if file_path and os.path.exists(file_path):
+                        source_paths[key] = file_path
+                    else:
+                        clip["status"] = "error"
+                        clip["error"]  = "Uploaded file no longer available. Please re-upload."
+                        continue
 
                 else:  # Google Drive
                     dest = os.path.join(tmp, f"src_{Path(key).name or 'video.mp4'}")
