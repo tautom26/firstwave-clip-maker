@@ -278,7 +278,7 @@ def download_drive_file(drive_url: str, dest: str):
         )
 
 
-def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str):
+def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str, on_step=None):
     vid_size = FRAME_W - 2 * VIDEO_INSET
     vid_x    = VIDEO_INSET
     vid_y    = (FRAME_H - vid_size) // 2
@@ -294,9 +294,11 @@ def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str
             f'-ss {to_sec(start):.3f} -i "{src_path}" '
             f'-t {dur:.3f} -c:v libx264 -c:a aac "{trimmed}"'
         )
+        if on_step: on_step("Rendering banner…")
 
         make_banner_png(banner, banner_png)
         make_mask_png(vid_size, mask_png)
+        if on_step: on_step("Compositing…")
 
         fc = (
             f"[1:v]crop=min(iw\\,ih):min(iw\\,ih),scale={vid_size}:{vid_size}[vid];"
@@ -417,6 +419,13 @@ with st.expander("＋  New clip", expanded=len(st.session_state.queue) == 0):
             if not output_name.endswith(".mp4"):
                 output_name += ".mp4"
 
+        if not errors:
+            try:
+                to_sec(start)
+                to_sec(end)
+            except (ValueError, AttributeError):
+                errors.append("Please use MM:SS format, e.g. 0:47")
+
         if errors:
             for e in errors:
                 st.error(e)
@@ -458,11 +467,17 @@ if st.session_state.queue:
         st.markdown(f"""
         <div class="clip-card">
             <div class="clip-card-title">📁 {src_label} &nbsp;&nbsp; {clip['start']} → {clip['end']} &nbsp;&nbsp; {status_html}</div>
-            <div class="clip-card-banner">{clip['banner']}</div>
             <div class="clip-card-meta">→ {clip['output']}</div>
             {'<div style="color:#f87171;font-size:0.8rem;margin-top:0.3rem">'+clip["error"]+'</div>' if clip.get("error") else ''}
         </div>
         """, unsafe_allow_html=True)
+
+        if clip["status"] in ("waiting", "error"):
+            try:
+                banner_img = render_banner_image(clip["banner"], width=400)
+                st.image(banner_img, use_container_width=False)
+            except Exception:
+                pass
 
         col_dl, col_rm = st.columns([5, 1])
 
@@ -546,10 +561,18 @@ if st.session_state.queue:
 
                 clip["status"] = "processing"
                 out_path = os.path.join(tmp, clip["output"])
-                progress.progress(step / total_steps, text=f"Rendering clip {i+1}/{len(waiting)}: {clip['output']}…")
+                label = f"Clip {i+1}/{len(waiting)}: {clip['output']}"
+                progress.progress(step / total_steps, text=f"Trimming {label}…")
+
+                # 3 sub-steps per clip: trim (done above) → banner → composite
+                SUB = 3
+                sub = [1]  # trim already started; callback fires at sub-steps 2 and 3
+                def on_step(text, _sub=sub, _step=step, _label=label):
+                    _sub[0] += 1
+                    progress.progress((_step + _sub[0] / SUB) / total_steps, text=f"{text} {_label}…")
 
                 try:
-                    process_clip(src, clip["start"], clip["end"], clip["banner"], out_path)
+                    process_clip(src, clip["start"], clip["end"], clip["banner"], out_path, on_step=on_step)
                     with open(out_path, "rb") as f:
                         st.session_state.results[clip["id"]] = f.read()
                     clip["status"] = "done"
