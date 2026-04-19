@@ -6,12 +6,10 @@ Run: streamlit run app.py
 import atexit
 import html
 import io
-import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -357,8 +355,6 @@ def process_clip(src_path: str, start: str, end: str, banner: str, out_path: str
 # ── Session state init ────────────────────────────────────────────────────────
 if "queue" not in st.session_state:
     st.session_state.queue = []
-if "source_cache" not in st.session_state:
-    st.session_state.source_cache = {}
 if "results" not in st.session_state:
     st.session_state.results = {}
 if "auto_generate" not in st.session_state:
@@ -554,7 +550,7 @@ if st.session_state.queue:
         if clip["status"] in ("waiting", "error"):
             try:
                 banner_img = render_banner_image(clip["banner"], width=400)
-                st.image(banner_img, width="content")
+                st.image(banner_img, use_container_width=False)
             except Exception:
                 pass
 
@@ -596,7 +592,7 @@ if st.session_state.queue:
 
     if run_generation:
         drive_keys = {c["filename"] for c in waiting if c["source_type"] == "Google Drive link"}
-        total_steps = len(drive_keys) + len(waiting)
+        total_steps = max(1, len(drive_keys) + len(waiting))
         step = 0
 
         progress = st.progress(0, text="Starting…")
@@ -698,6 +694,13 @@ if st.session_state.queue:
     if st.button("Clear queue", use_container_width=False):
         st.session_state.queue   = []
         st.session_state.results = {}
+        upload_dir = st.session_state.get("upload_dir")
+        if upload_dir and os.path.isdir(upload_dir):
+            for f in os.listdir(upload_dir):
+                try:
+                    os.remove(os.path.join(upload_dir, f))
+                except OSError:
+                    pass
         st.rerun()
 
 else:
